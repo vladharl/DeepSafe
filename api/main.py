@@ -22,6 +22,7 @@ import base64
 import requests
 import logging
 from typing import Dict, Any, List, Optional, Union, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -49,6 +50,7 @@ from fastapi import Depends, status
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from database import init_db, get_db, AnalysisHistory
+from frame_extractor import extract_frames_at_interval, FrameData
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -433,6 +435,18 @@ class PredictInput(BaseModel):
         pattern="^(voting|average|stacking)$",
     )
 
+    # Enhanced video analysis options
+    enable_frame_analysis: bool = Field(
+        default=True,
+        description="Enable frame-by-frame image model analysis for videos"
+    )
+    frame_interval_seconds: float = Field(
+        default=1.0,
+        ge=0.1,
+        le=10.0,
+        description="Time interval between sampled frames for image model analysis (seconds)"
+    )
+
     @model_validator(mode="after")
     def check_media_data_consistency(self) -> "PredictInput":
         media_type = self.media_type
@@ -637,6 +651,129 @@ def query_model_api(
     }
 
 
+# --- Frame-by-Frame Video Analysis ---
+
+def analyze_frames_with_image_models(
+    video_bytes: bytes,
+    image_model_endpoints: Dict[str, str],
+    threshold: float,
+    request_id: str,
+    frame_interval_seconds: float = 1.0,
+    max_workers: int = 4,
+) -> Dict[str, Any]:
+    """
+    Extract frames from video at specified intervals and run image models on each frame.
+
+    Returns:
+        Dict containing frame-level analysis results
+    """
+    try:
+        frames, video_duration, fps = extract_frames_at_interval(
+            video_bytes,
+            interval_seconds=frame_interval_seconds,
+            include_thumbnails=True,
+            max_frames=60  # Safety limit
+        )
+    except Exception as e:
+        logger.error(f"Request {request_id}: Failed to extract frames: {e}")
+        return {
+            "error": str(e),
+            "total_frames_analyzed": 0,
+            "frames": []
+        }
+
+    if not frames:
+        logger.warning(f"Request {request_id}: No frames extracted from video")
+        return {
+            "total_frames_analyzed": 0,
+            "frame_interval_seconds": frame_interval_seconds,
+            "video_duration_seconds": video_duration,
+            "frames": [],
+            "suspicious_frames": []
+        }
+
+    logger.info(
+        f"Request {request_id}: Extracted {len(frames)} frames at {frame_interval_seconds}s intervals "
+        f"from {video_duration:.2f}s video"
+    )
+
+    frame_results = []
+    all_frame_scores = []
+
+    # Process each frame with all image models
+    for frame_data in frames:
+        frame_result = {
+            "frame_index": frame_data.frame_index,
+            "timestamp_seconds": frame_data.timestamp_seconds,
+            "thumbnail_base64": frame_data.thumbnail_base64,
+            "image_model_results": {},
+            "aggregate_frame_score": None
+        }
+
+        frame_model_scores = []
+
+        # Query each image model for this frame
+        for model_name, endpoint in image_model_endpoints.items():
+            try:
+                result = query_model_api(
+                    model_name,
+                    "image",
+                    frame_data.frame_base64,
+                    threshold,
+                    f"{request_id}_frame_{frame_data.frame_index}"
+                )
+
+                if "error" not in result:
+                    frame_result["image_model_results"][model_name] = {
+                        "probability": result.get("probability"),
+                        "prediction": result.get("prediction"),
+                        "class": result.get("class"),
+                        "inference_time": result.get("inference_time")
+                    }
+                    if result.get("probability") is not None:
+                        frame_model_scores.append(result["probability"])
+                else:
+                    frame_result["image_model_results"][model_name] = {
+                        "error": result["error"]
+                    }
+            except Exception as e:
+                logger.warning(
+                    f"Request {request_id}: Error querying {model_name} for frame {frame_data.frame_index}: {e}"
+                )
+                frame_result["image_model_results"][model_name] = {"error": str(e)}
+
+        # Calculate aggregate frame score (mean of all image model probabilities)
+        if frame_model_scores:
+            frame_result["aggregate_frame_score"] = float(np.mean(frame_model_scores))
+            all_frame_scores.append(frame_result["aggregate_frame_score"])
+
+        frame_results.append(frame_result)
+
+    # Identify suspicious frames (high fake probability)
+    suspicious_frames = []
+    for fr in frame_results:
+        if fr["aggregate_frame_score"] is not None and fr["aggregate_frame_score"] >= threshold:
+            suspicious_frames.append({
+                "frame_index": fr["frame_index"],
+                "timestamp_seconds": fr["timestamp_seconds"],
+                "score": fr["aggregate_frame_score"],
+                "reason": "High fake probability from image models"
+            })
+
+    # Sort suspicious frames by score (highest first)
+    suspicious_frames.sort(key=lambda x: x["score"], reverse=True)
+
+    return {
+        "total_frames_analyzed": len(frames),
+        "frame_interval_seconds": frame_interval_seconds,
+        "video_duration_seconds": video_duration,
+        "fps": fps,
+        "frames": frame_results,
+        "suspicious_frames": suspicious_frames[:10],  # Top 10 most suspicious
+        "aggregate_score": float(np.mean(all_frame_scores)) if all_frame_scores else None
+    }
+
+
 def calculate_ensemble_verdict_api(
     results: Dict[str, Dict],
     threshold: float,
@@ -701,7 +838,12 @@ def calculate_ensemble_verdict_api(
 
     if actual_method_used == "voting":
         if total_valid_models > 0:
-            ensemble_prob_fake_score = float(base_fake_votes / total_valid_models)
+            # When only 1 model responds, use its actual probability instead of 0 or 100%
+            if total_valid_models == 1:
+                single_model_prob = list(valid_results.values())[0].get("probability", 0.5)
+                ensemble_prob_fake_score = float(single_model_prob)
+            else:
+                ensemble_prob_fake_score = float(base_fake_votes / total_valid_models)
         else:
             ensemble_prob_fake_score = 0.5
     elif actual_method_used == "average":
@@ -947,6 +1089,8 @@ async def predict_media_endpoint_api(request: Request, input_data: PredictInput)
 
     start_overall_time = time.time()
     model_query_results: Dict[str, Dict] = {}
+    frame_analysis_results: Optional[Dict[str, Any]] = None
+
     for model_name in models_to_use_names:
         if model_name not in model_endpoints_for_type:
             logger.warning(
@@ -959,6 +1103,38 @@ async def predict_media_endpoint_api(request: Request, input_data: PredictInput)
         model_query_results[model_name] = query_model_api(
             model_name, media_type, encoded_media_content, input_data.threshold, req_id
         )
+
+    # For video: run frame-by-frame analysis with image models if enabled
+    if media_type == "video" and input_data.enable_frame_analysis:
+        image_config = (
+            ALL_MODEL_CONFIGS.get("media_types", {}) if ALL_MODEL_CONFIGS else {}
+        ).get("image", {})
+        image_model_endpoints = image_config.get("model_endpoints", {})
+
+        if image_model_endpoints:
+            logger.info(
+                f"Request {req_id}: Running frame-by-frame analysis with image models "
+                f"(interval: {input_data.frame_interval_seconds}s)"
+            )
+            try:
+                video_bytes = base64.b64decode(encoded_media_content)
+                frame_analysis_results = analyze_frames_with_image_models(
+                    video_bytes=video_bytes,
+                    image_model_endpoints=image_model_endpoints,
+                    threshold=input_data.threshold,
+                    request_id=req_id,
+                    frame_interval_seconds=input_data.frame_interval_seconds,
+                )
+                logger.info(
+                    f"Request {req_id}: Frame analysis complete. "
+                    f"Analyzed {frame_analysis_results.get('total_frames_analyzed', 0)} frames, "
+                    f"found {len(frame_analysis_results.get('suspicious_frames', []))} suspicious frames"
+                )
+            except Exception as e:
+                logger.error(f"Request {req_id}: Frame analysis failed: {e}")
+                frame_analysis_results = {"error": str(e)}
+        else:
+            logger.warning(f"Request {req_id}: No image models configured for frame analysis")
 
     if not any("error" not in r_data for r_data in model_query_results.values()):
         logger.error(
@@ -1008,6 +1184,27 @@ async def predict_media_endpoint_api(request: Request, input_data: PredictInput)
         "model_results": model_query_results,
         "processing_mode": "CPU-only",
     }
+
+    # Include frame analysis for videos
+    if frame_analysis_results is not None:
+        response_payload["frame_analysis"] = frame_analysis_results
+
+    # Include temporal analysis from video models (per-frame/per-face details)
+    if media_type == "video":
+        temporal_analysis = {}
+        for model_name, result in model_query_results.items():
+            if isinstance(result, dict) and "error" not in result:
+                # Extract enhanced details from video model response
+                if "frame_details" in result or "per_face_scores" in result:
+                    temporal_analysis[model_name] = {
+                        "probability": result.get("probability"),
+                        "total_frames_sampled": result.get("total_frames_sampled"),
+                        "total_faces_analyzed": result.get("total_faces_analyzed"),
+                        "frame_details": result.get("frame_details", []),
+                        "per_face_scores": result.get("per_face_scores", []),
+                    }
+        if temporal_analysis:
+            response_payload["temporal_analysis"] = temporal_analysis
 
     # Save to database history
     try:
@@ -1108,6 +1305,8 @@ async def detect_media_endpoint_api_form(
     threshold: Optional[float] = Form(None),
     ensemble_method: Optional[str] = Form(None),
     models: Optional[str] = Form(None),
+    enable_frame_analysis: Optional[bool] = Form(True),
+    frame_interval_seconds: Optional[float] = Form(1.0),
 ):
     req_id = request.state.request_id
     content_type = file.content_type
@@ -1199,6 +1398,8 @@ async def detect_media_endpoint_api_form(
             "threshold": final_threshold,
             "ensemble_method": final_ensemble_method,
             "models": parsed_models_list,
+            "enable_frame_analysis": enable_frame_analysis if enable_frame_analysis is not None else True,
+            "frame_interval_seconds": frame_interval_seconds if frame_interval_seconds is not None else 1.0,
         }
         payload_key_for_media_data = MEDIA_TYPE_PAYLOAD_KEYS.get(inferred_media_type)
         if not payload_key_for_media_data:
@@ -1243,6 +1444,13 @@ async def detect_media_endpoint_api_form(
             "media_type_processed": inferred_media_type,
             "filename": file.filename,
         }
+
+        # Include frame analysis and temporal analysis for videos
+        if inferred_media_type == "video":
+            if "frame_analysis" in full_prediction_result:
+                ui_response["frame_analysis"] = full_prediction_result["frame_analysis"]
+            if "temporal_analysis" in full_prediction_result:
+                ui_response["temporal_analysis"] = full_prediction_result["temporal_analysis"]
         return ui_response
     except HTTPException:
         raise

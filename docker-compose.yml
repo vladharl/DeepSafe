@@ -81,19 +81,19 @@ services:
     networks:
       - deepsafe-network
 
-  # trufor:
-  #   build: ./models/image/trufor
-  #   container_name: deepsafe-trufor
-  #   ports:
-  #     - "5005:5005"
-  #   restart: unless-stopped
-  #   environment:
-  #     - MODEL_PORT=5005
-  #     - PRELOAD_MODEL=false
-  #     - MODEL_TIMEOUT=600
-  #     - USE_GPU=false
-  #   networks:
-  #     - deepsafe-network
+  trufor:
+    build: ./models/image/trufor
+    container_name: deepsafe-trufor
+    ports:
+      - "5005:5005"
+    restart: unless-stopped
+    environment:
+      - MODEL_PORT=5005
+      - PRELOAD_MODEL=false
+      - MODEL_TIMEOUT=600
+      - USE_GPU=false
+    networks:
+      - deepsafe-network
 
   # spsl_deepfake_detection:
   #   build: ./models/image/spsl_deepfake_detection
@@ -149,6 +149,31 @@ services:
     #   resources:
     #     limits:
     #       cpus: '2.0' 
+    #       memory: 4G
+
+  # --- FakeSTormer Video Model ---
+  fake_stormer:
+    build: ./models/video/fake_stormer
+    container_name: deepsafe-fake-stormer
+    ports:
+      - "7002:7002"
+    restart: unless-stopped
+    volumes:
+      - ./models/video/fake_stormer/weights:/app/weights:ro
+    environment:
+      - MODEL_PORT=7002
+      - PRELOAD_MODEL=false
+      - MODEL_TIMEOUT=900
+      - USE_GPU=false
+      - FRAMES_PER_VIDEO=32
+      - FAKESTORMER_MODEL_PATH=/app/weights/TopDownDetector_C23_ViTBase224_ST_hm100_tempLOC0.2_4SBI_SAM_mp0.01_temp2_0vidAug_0.35_temp_normlms_normREAL_model_best.pth
+    networks:
+      - deepsafe-network
+    # Optional: Resource limits for this model
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '2.0'
     #       memory: 4G
 
   # --- Placeholder for future audio model service ---

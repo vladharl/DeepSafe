@@ -14,3 +14,5 @@ rich
 python-jose[cryptography]
 passlib[bcrypt]
 sqlalchemy==2.0.21
+opencv-python-headless
+numpy

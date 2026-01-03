@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 from typing import Dict, Any, Optional, List, Tuple, OrderedDict  # Added OrderedDict
+from dataclasses import dataclass, asdict
 
 # Ensure paths are set for model imports
 module_paths_to_add = [
@@ -113,6 +114,37 @@ MTCNN_MIN_FACE_SIZE = 40  # As in original repo
 IMAGENET_NORMALIZE_TRANSFORM = T.Normalize(
     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
 )
+
+
+@dataclass
+class FaceDetail:
+    """Details about a detected face in a frame."""
+    face_id: int
+    bbox: List[int]  # [x, y, width, height]
+    score: float
+    confidence: float  # MTCNN detection confidence
+
+
+@dataclass
+class FrameDetail:
+    """Details about a processed frame."""
+    frame_index: int
+    timestamp_seconds: float
+    faces: List[FaceDetail]
+    frame_score: Optional[float] = None  # Average score of all faces in frame
+
+
+@dataclass
+class VideoAnalysisResult:
+    """Complete video analysis result with per-frame details."""
+    probability: float
+    prediction: int
+    class_label: str
+    total_frames_sampled: int
+    total_faces_analyzed: int
+    frame_details: List[FrameDetail]
+    per_face_scores: List[float]
+
 
 model_instance: Optional[torch.nn.Module] = None
 model_config_loaded: Optional[Dict] = None
@@ -293,24 +325,45 @@ def unload_model_if_idle():
             logger.info("Model unloaded.")
 
 
+@dataclass
+class ExtractedFrame:
+    """Container for an extracted frame with metadata."""
+    frame_index: int
+    timestamp_seconds: float
+    frame_rgb: np.ndarray
+
+
 def extract_frames_from_video_bytes(
     video_bytes: bytes, num_frames_to_sample: int
-) -> List[np.ndarray]:
+) -> Tuple[List[ExtractedFrame], float, float]:
+    """
+    Extract frames from video bytes.
+
+    Returns:
+        Tuple of (list of ExtractedFrame, video_duration_seconds, fps)
+    """
     temp_video_path = f"/tmp/temp_video_{os.urandom(8).hex()}.mp4"  # Using os.urandom for unique filename
+    frames: List[ExtractedFrame] = []
+    video_duration = 0.0
+    fps = 0.0
+
     try:
         with open(temp_video_path, "wb") as f:
             f.write(video_bytes)
 
-        frames = []
         cap = cv2.VideoCapture(temp_video_path)
         if not cap.isOpened():
             logger.error(f"Failed to open temporary video file: {temp_video_path}")
-            return frames
+            return frames, 0.0, 0.0
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames == 0:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
+        if total_frames == 0 or fps <= 0:
             cap.release()
-            return frames
+            return frames, 0.0, 0.0
+
+        video_duration = total_frames / fps
 
         frame_indices = np.linspace(
             0, total_frames - 1, num_frames_to_sample, dtype=int
@@ -320,10 +373,15 @@ def extract_frames_from_video_bytes(
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
             if ret:
-                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                timestamp = idx / fps
+                frames.append(ExtractedFrame(
+                    frame_index=int(idx),
+                    timestamp_seconds=round(timestamp, 2),
+                    frame_rgb=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                ))
 
         cap.release()
-        return frames
+        return frames, video_duration, fps
     finally:
         if os.path.exists(temp_video_path):
             try:
@@ -336,7 +394,13 @@ def extract_frames_from_video_bytes(
 
 def process_video_and_predict(
     video_bytes: bytes, input_threshold: float, variant_to_load: str
-) -> Tuple[float, int, str]:
+) -> VideoAnalysisResult:
+    """
+    Process video and return detailed analysis with per-frame/per-face scores.
+
+    Returns:
+        VideoAnalysisResult with complete analysis details
+    """
     ensure_model_loaded(variant_to_load)
     if not all(
         [
@@ -351,17 +415,31 @@ def process_video_and_predict(
             detail=f"Model or preprocessor for '{variant_to_load}' not available.",
         )
 
-    frames_rgb = extract_frames_from_video_bytes(
+    extracted_frames, video_duration, fps = extract_frames_from_video_bytes(
         video_bytes, FRAMES_PER_VIDEO_TO_SAMPLE
     )
-    if not frames_rgb:
+    if not extracted_frames:
         logger.warning("No frames extracted from video.")
-        return 0.5, 0, "real"
+        return VideoAnalysisResult(
+            probability=0.5,
+            prediction=0,
+            class_label="real",
+            total_frames_sampled=0,
+            total_faces_analyzed=0,
+            frame_details=[],
+            per_face_scores=[]
+        )
 
-    all_face_scores = []
-    # image_size_for_model = model_config_loaded['model']['image-size'] # Already used to create face_transform_pipeline
+    all_face_scores: List[float] = []
+    frame_details: List[FrameDetail] = []
 
-    for frame_idx, frame in enumerate(frames_rgb):
+    for extracted_frame in extracted_frames:
+        frame = extracted_frame.frame_rgb
+        frame_idx = extracted_frame.frame_index
+        timestamp = extracted_frame.timestamp_seconds
+
+        frame_faces: List[FaceDetail] = []
+
         try:
             # MTCNN expects RGB numpy array or PIL Image
             # Frame is already HWC RGB numpy array
@@ -379,22 +457,10 @@ def process_video_and_predict(
                     xmin, ymin, xmax, ymax = [int(b) for b in box]
 
                     # Face padding strategy (consistent with original repo's train/test)
-                    # This aims for a square-ish crop around the face.
-                    # The original `extract_crops.py` makes them square BEFORE IsotropicResize.
-                    # Here we apply padding, then IsotropicResize will handle aspect.
                     w_face = xmax - xmin
                     h_face = ymax - ymin
-                    pad_h_local, pad_w_local = 0, 0
 
-                    # Option 1: Square padding (similar to original preprocessing's intent)
-                    # if h_face > w_face:
-                    #     pad_w_local = int((h_face - w_face) / 2)
-                    # elif h_face < w_face:
-                    #     pad_h_local = int((w_face - h_face) / 2)
-
-                    # Option 2: Proportional padding (as in user's existing code)
-                    # This provides more context around the face.
-                    # CRITICAL: This padding MUST match the training data generation.
+                    # Proportional padding
                     pad_h_local = h_face // 3
                     pad_w_local = w_face // 3
 
@@ -436,30 +502,66 @@ def process_video_and_predict(
                     with torch.no_grad():
                         logits = model_instance(face_tensor_final)
                         score = torch.sigmoid(logits).squeeze().item()
+
                     all_face_scores.append(score)
+
+                    # Store face details with bbox in [x, y, width, height] format
+                    face_details = FaceDetail(
+                        face_id=i,
+                        bbox=[xmin, ymin, w_face, h_face],
+                        score=float(score),
+                        confidence=float(prob)
+                    )
+                    frame_faces.append(face_details)
             else:
                 logger.debug(f"No faces detected in frame {frame_idx} with MTCNN.")
         except Exception as e_frame:
             logger.warning(
                 f"Error processing a frame/face (frame {frame_idx}): {e_frame}",
                 exc_info=False,
-            )  # Set exc_info=True for full trace
+            )
             continue
+
+        # Calculate frame-level score (average of all faces in this frame)
+        frame_score = None
+        if frame_faces:
+            frame_score = float(np.mean([f.score for f in frame_faces]))
+
+        frame_details.append(FrameDetail(
+            frame_index=frame_idx,
+            timestamp_seconds=timestamp,
+            faces=frame_faces,
+            frame_score=frame_score
+        ))
 
     if not all_face_scores:
         logger.info(
             "No faces detected or processed successfully across all sampled frames."
         )
-        return 0.5, 0, "real"  # Default to real if no faces processed
+        return VideoAnalysisResult(
+            probability=0.5,
+            prediction=0,
+            class_label="real",
+            total_frames_sampled=len(extracted_frames),
+            total_faces_analyzed=0,
+            frame_details=frame_details,
+            per_face_scores=[]
+        )
 
-    # Aggregation: simple mean of scores for now.
-    # Can be refined based on original repo's custom_video_round if needed.
+    # Aggregation: simple mean of scores
     final_video_prob_fake = float(np.mean(all_face_scores))
-
     final_video_prediction = 1 if final_video_prob_fake >= input_threshold else 0
     final_video_class_label = "fake" if final_video_prediction == 1 else "real"
 
-    return final_video_prob_fake, final_video_prediction, final_video_class_label
+    return VideoAnalysisResult(
+        probability=final_video_prob_fake,
+        prediction=final_video_prediction,
+        class_label=final_video_class_label,
+        total_frames_sampled=len(extracted_frames),
+        total_faces_analyzed=len(all_face_scores),
+        frame_details=frame_details,
+        per_face_scores=all_face_scores
+    )
 
 
 @app.on_event("startup")
@@ -592,27 +694,55 @@ async def unload_model_endpoint():
     }
 
 
+def _serialize_frame_details(frame_details: List[FrameDetail]) -> List[Dict[str, Any]]:
+    """Serialize frame details to JSON-serializable format."""
+    result = []
+    for fd in frame_details:
+        faces_list = []
+        for face in fd.faces:
+            faces_list.append({
+                "face_id": face.face_id,
+                "bbox": face.bbox,
+                "score": face.score,
+                "confidence": face.confidence
+            })
+        result.append({
+            "frame_index": fd.frame_index,
+            "timestamp_seconds": fd.timestamp_seconds,
+            "faces": faces_list,
+            "frame_score": fd.frame_score
+        })
+    return result
+
+
 @app.post("/predict", response_model=Dict[str, Any])
 async def predict_video(input_data: VideoInput):
     req_start_time = time.time()
     try:
         video_bytes = base64.b64decode(input_data.video_data)
 
-        prob_fake, pred_class_idx, class_label = process_video_and_predict(
+        result = process_video_and_predict(
             video_bytes, input_data.threshold, input_data.model_variant
         )
 
         inference_time = time.time() - req_start_time
         logger.info(
-            f"Video prediction for variant '{input_data.model_variant}' completed in {inference_time:.4f}s. Prob Fake: {prob_fake:.4f}, Class: {class_label}"
+            f"Video prediction for variant '{input_data.model_variant}' completed in {inference_time:.4f}s. "
+            f"Prob Fake: {result.probability:.4f}, Class: {result.class_label}, "
+            f"Frames: {result.total_frames_sampled}, Faces: {result.total_faces_analyzed}"
         )
 
         return {
             "model": f"{MODEL_NAME_DISPLAY}_{input_data.model_variant}",
-            "probability": prob_fake,
-            "prediction": pred_class_idx,
-            "class": class_label,
+            "probability": result.probability,
+            "prediction": result.prediction,
+            "class": result.class_label,
             "inference_time": inference_time,
+            # Enhanced details for per-frame/per-face analysis
+            "total_frames_sampled": result.total_frames_sampled,
+            "total_faces_analyzed": result.total_faces_analyzed,
+            "frame_details": _serialize_frame_details(result.frame_details),
+            "per_face_scores": result.per_face_scores,
         }
     except FileNotFoundError as e:
         logger.error(f"Model file error during prediction: {e}", exc_info=True)

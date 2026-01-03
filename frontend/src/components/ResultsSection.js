@@ -1,9 +1,9 @@
 // frontend/src/components/ResultsSection.js
 import React, { useState, useEffect } from 'react';
-import { 
-  AlertTriangle, CheckCircle, BarChart3, Clock, Users, Info, ChevronDown, 
-  Download, Copy, Shield, Activity, FileJson, FileText, AlertCircle as AlertCircleIcon, 
-  ChevronUp, ListTree, PieChart as PieChartIcon, TrendingUp, Brain, Zap
+import {
+  AlertTriangle, CheckCircle, BarChart3, Clock, Users, Info, ChevronDown,
+  Download, Copy, Shield, Activity, FileJson, FileText, AlertCircle as AlertCircleIcon,
+  ChevronUp, ListTree, PieChart as PieChartIcon, TrendingUp, Brain, Zap, Film, User, Map
 } from 'lucide-react';
 import { 
   formatProbability, 
@@ -14,6 +14,9 @@ import {
 import VisualizationCard from './VisualizationCard';
 import ModelResultsChart from './ModelResultsChart';
 import DebugInfoPanel from './DebugInfoPanel.js';
+import VideoTimeline from './VideoTimeline';
+import FaceAnalysisGrid from './FaceAnalysisGrid';
+import HeatmapOverlay from './HeatmapOverlay';
 
 const ResultsSection = ({ result, loading, modelProgress, debugMode, onExport, fileName, preview, mediaType }) => {
   const [showIndividualModelDetails, setShowIndividualModelDetails] = useState(false);
@@ -165,10 +168,19 @@ const ResultsSection = ({ result, loading, modelProgress, debugMode, onExport, f
   const individualModelResults = result.model_results || {}; 
   const hasIndividualModelResults = Object.keys(individualModelResults).length > 0;
 
+  // Check for video-specific data
+  const hasFrameAnalysis = result?.frame_analysis && result.frame_analysis.frames?.length > 0;
+  const hasTemporalAnalysis = result?.temporal_analysis && Object.keys(result.temporal_analysis).length > 0;
+  const isVideo = mediaType === 'video';
+
+  // Build tabs based on available data
   const tabs = [
     { id: 'summary', label: 'Summary', icon: <TrendingUp size={16} /> },
     { id: 'details', label: 'Model Analysis', icon: <Brain size={16} /> },
     { id: 'visualizations', label: 'Visualizations', icon: <PieChartIcon size={16} /> },
+    // Video-specific tabs
+    ...(isVideo && hasFrameAnalysis ? [{ id: 'timeline', label: 'Timeline', icon: <Film size={16} /> }] : []),
+    ...(isVideo && hasTemporalAnalysis ? [{ id: 'faces', label: 'Faces', icon: <User size={16} /> }] : []),
   ];
 
   return (
@@ -350,6 +362,27 @@ const ResultsSection = ({ result, loading, modelProgress, debugMode, onExport, f
                 <ModelResultsChart modelResults={individualModelResults} />
               </div>
             )}
+          </div>
+        )}
+
+        {/* Video Timeline Tab */}
+        {activeTab === 'timeline' && isVideo && hasFrameAnalysis && (
+          <div className="animate-fade-in">
+            <VideoTimeline
+              frameAnalysis={result.frame_analysis}
+              temporalAnalysis={result.temporal_analysis}
+              videoDuration={result.frame_analysis?.video_duration_seconds}
+            />
+          </div>
+        )}
+
+        {/* Face Analysis Tab */}
+        {activeTab === 'faces' && isVideo && hasTemporalAnalysis && (
+          <div className="animate-fade-in">
+            <FaceAnalysisGrid
+              temporalAnalysis={result.temporal_analysis}
+              frameAnalysis={result.frame_analysis}
+            />
           </div>
         )}
 

@@ -15,3 +15,4 @@ deepsafe_utils/__pycache__/visualizer.cpython-313.pyc
 *.pyc   
 models/audio/vocoder_artifacts/temp_repo
 models/audio/vocoder_artifacts/temp_repo
+models/video/fake_stormer/weights/*.pth

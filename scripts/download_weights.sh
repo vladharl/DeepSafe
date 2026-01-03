@@ -8,6 +8,7 @@ echo "Downloading DeepSafe Model Weights..."
 # Directory setup
 mkdir -p models/image/wavelet_clip_detection/model_code/weights
 mkdir -p models/video/cross_efficient_vit/model_code/gdrive_weights
+mkdir -p models/video/fake_stormer/model_code/weights
 
 # Wavelet-CLIP Weights
 echo "------------------------------------------------"

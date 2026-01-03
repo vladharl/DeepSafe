@@ -8,9 +8,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8000
 
-# Install system dependencies
+# Install system dependencies (including OpenCV dependencies for frame extraction)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -24,6 +27,7 @@ RUN pip install uv && \
 # Copy application code
 COPY main.py .
 COPY database.py .
+COPY frame_extractor.py .
 
 # Expose the port the app runs on
 EXPOSE ${PORT}

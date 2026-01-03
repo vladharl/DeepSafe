@@ -1,0 +1,23 @@
+# FakeSTormer Video Deepfake Detection Service Requirements
+
+# Core dependencies
+numpy<2.0,>=1.21.0
+Pillow>=8.3.1
+
+# YAML config
+pyyaml
+
+# Timm for vision transformers
+timm==0.4.12
+
+# FastAPI service
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+pydantic>=2.0.0
+python-multipart
+requests
+
+# Additional dependencies
+einops
+tqdm
+scikit-learn
