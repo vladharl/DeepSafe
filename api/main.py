@@ -21,7 +21,7 @@ import time
 import base64
 import requests
 import logging
-from typing import Dict, Any, List, Optional, Union, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -659,10 +659,11 @@ def analyze_frames_with_image_models(
     threshold: float,
     request_id: str,
     frame_interval_seconds: float = 1.0,
-    max_workers: int = 4,
+    max_workers: int = 8,
 ) -> Dict[str, Any]:
     """
     Extract frames from video at specified intervals and run image models on each frame.
+    Uses parallel processing for both frames and models.
 
     Returns:
         Dict containing frame-level analysis results
@@ -694,14 +695,11 @@ def analyze_frames_with_image_models(
 
     logger.info(
         f"Request {request_id}: Extracted {len(frames)} frames at {frame_interval_seconds}s intervals "
-        f"from {video_duration:.2f}s video"
+        f"from {video_duration:.2f}s video. Processing with {len(image_model_endpoints)} models in parallel."
     )
 
-    frame_results = []
-    all_frame_scores = []
-
-    # Process each frame with all image models
-    for frame_data in frames:
+    def process_single_frame(frame_data: FrameData) -> Dict[str, Any]:
+        """Process a single frame with all image models in parallel."""
         frame_result = {
             "frame_index": frame_data.frame_index,
             "timestamp_seconds": frame_data.timestamp_seconds,
@@ -711,43 +709,75 @@ def analyze_frames_with_image_models(
         }
 
         frame_model_scores = []
+        model_names = list(image_model_endpoints.keys())
 
-        # Query each image model for this frame
-        for model_name, endpoint in image_model_endpoints.items():
-            try:
-                result = query_model_api(
+        # Query all image models for this frame in parallel
+        with ThreadPoolExecutor(max_workers=len(model_names)) as model_executor:
+            future_to_model = {
+                model_executor.submit(
+                    query_model_api,
                     model_name,
                     "image",
                     frame_data.frame_base64,
                     threshold,
                     f"{request_id}_frame_{frame_data.frame_index}"
-                )
+                ): model_name
+                for model_name in model_names
+            }
 
-                if "error" not in result:
-                    frame_result["image_model_results"][model_name] = {
-                        "probability": result.get("probability"),
-                        "prediction": result.get("prediction"),
-                        "class": result.get("class"),
-                        "inference_time": result.get("inference_time")
-                    }
-                    if result.get("probability") is not None:
-                        frame_model_scores.append(result["probability"])
-                else:
-                    frame_result["image_model_results"][model_name] = {
-                        "error": result["error"]
-                    }
-            except Exception as e:
-                logger.warning(
-                    f"Request {request_id}: Error querying {model_name} for frame {frame_data.frame_index}: {e}"
-                )
-                frame_result["image_model_results"][model_name] = {"error": str(e)}
+            for future in as_completed(future_to_model):
+                model_name = future_to_model[future]
+                try:
+                    result = future.result()
+                    if "error" not in result:
+                        frame_result["image_model_results"][model_name] = {
+                            "probability": result.get("probability"),
+                            "prediction": result.get("prediction"),
+                            "class": result.get("class"),
+                            "inference_time": result.get("inference_time")
+                        }
+                        if result.get("probability") is not None:
+                            frame_model_scores.append(result["probability"])
+                    else:
+                        frame_result["image_model_results"][model_name] = {
+                            "error": result["error"]
+                        }
+                except Exception as e:
+                    logger.warning(
+                        f"Request {request_id}: Error querying {model_name} for frame {frame_data.frame_index}: {e}"
+                    )
+                    frame_result["image_model_results"][model_name] = {"error": str(e)}
 
         # Calculate aggregate frame score (mean of all image model probabilities)
         if frame_model_scores:
             frame_result["aggregate_frame_score"] = float(np.mean(frame_model_scores))
-            all_frame_scores.append(frame_result["aggregate_frame_score"])
 
-        frame_results.append(frame_result)
+        return frame_result
+
+    # Process all frames in parallel
+    frame_results = []
+    all_frame_scores = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as frame_executor:
+        future_to_frame = {
+            frame_executor.submit(process_single_frame, frame_data): frame_data.frame_index
+            for frame_data in frames
+        }
+
+        for future in as_completed(future_to_frame):
+            frame_index = future_to_frame[future]
+            try:
+                frame_result = future.result()
+                frame_results.append(frame_result)
+                if frame_result["aggregate_frame_score"] is not None:
+                    all_frame_scores.append(frame_result["aggregate_frame_score"])
+            except Exception as e:
+                logger.error(
+                    f"Request {request_id}: Failed to process frame {frame_index}: {e}"
+                )
+
+    # Sort frame results by frame index to maintain order
+    frame_results.sort(key=lambda x: x["frame_index"])
 
     # Identify suspicious frames (high fake probability)
     suspicious_frames = []
@@ -921,6 +951,36 @@ async def health_check_api_endpoint(request: Request):
         else []
     )
 
+    # Collect all health check tasks across all media types
+    all_health_checks: List[Tuple[str, str]] = []  # (model_name, media_type)
+    for m_type in media_types_in_config:
+        current_media_type_config = (
+            ALL_MODEL_CONFIGS.get("media_types", {}) if ALL_MODEL_CONFIGS else {}
+        ).get(m_type, {})
+        model_endpoints_for_this_type = current_media_type_config.get(
+            "model_endpoints", {}
+        )
+        for model_name in model_endpoints_for_this_type.keys():
+            all_health_checks.append((model_name, m_type))
+
+    # Run all health checks in parallel
+    health_results: Dict[str, Dict[str, Any]] = {}  # {media_type: {model_name: result}}
+    if all_health_checks:
+        with ThreadPoolExecutor(max_workers=len(all_health_checks)) as executor:
+            future_to_check = {
+                executor.submit(check_model_health_api, model_name, m_type): (model_name, m_type)
+                for model_name, m_type in all_health_checks
+            }
+            for future in as_completed(future_to_check):
+                model_name, m_type = future_to_check[future]
+                if m_type not in health_results:
+                    health_results[m_type] = {}
+                try:
+                    health_results[m_type][model_name] = future.result()
+                except Exception as exc:
+                    health_results[m_type][model_name] = {"status": "error", "message": str(exc)}
+
+    # Build the response from parallel results
     for m_type in media_types_in_config:
         type_specific_status: Dict[str, Any] = {"status": "healthy", "models": {}}
         all_models_for_type_healthy = True
@@ -936,7 +996,9 @@ async def health_check_api_endpoint(request: Request):
             type_specific_status["status"] = "no_models_configured"
         else:
             for model_name in model_endpoints_for_this_type.keys():
-                model_health_info = check_model_health_api(model_name, m_type)
+                model_health_info = health_results.get(m_type, {}).get(
+                    model_name, {"status": "unknown", "message": "Health check not executed"}
+                )
                 type_specific_status["models"][model_name] = model_health_info
                 if model_health_info.get("status") != "healthy":
                     all_models_for_type_healthy = False
@@ -1091,6 +1153,8 @@ async def predict_media_endpoint_api(request: Request, input_data: PredictInput)
     model_query_results: Dict[str, Dict] = {}
     frame_analysis_results: Optional[Dict[str, Any]] = None
 
+    # Filter out unconfigured models first
+    valid_models_to_query = []
     for model_name in models_to_use_names:
         if model_name not in model_endpoints_for_type:
             logger.warning(
@@ -1099,10 +1163,35 @@ async def predict_media_endpoint_api(request: Request, input_data: PredictInput)
             model_query_results[model_name] = {
                 "error": f"Model '{model_name}' not configured for media_type '{media_type}'."
             }
-            continue
-        model_query_results[model_name] = query_model_api(
-            model_name, media_type, encoded_media_content, input_data.threshold, req_id
+        else:
+            valid_models_to_query.append(model_name)
+
+    # Query all models in parallel using ThreadPoolExecutor
+    if valid_models_to_query:
+        logger.info(
+            f"Request {req_id}: Querying {len(valid_models_to_query)} models in parallel: {valid_models_to_query}"
         )
+        with ThreadPoolExecutor(max_workers=len(valid_models_to_query)) as executor:
+            future_to_model = {
+                executor.submit(
+                    query_model_api,
+                    model_name,
+                    media_type,
+                    encoded_media_content,
+                    input_data.threshold,
+                    req_id,
+                ): model_name
+                for model_name in valid_models_to_query
+            }
+            for future in as_completed(future_to_model):
+                model_name = future_to_model[future]
+                try:
+                    model_query_results[model_name] = future.result()
+                except Exception as exc:
+                    logger.error(
+                        f"Request {req_id}: Model '{model_name}' raised exception: {exc}"
+                    )
+                    model_query_results[model_name] = {"error": str(exc)}
 
     # For video: run frame-by-frame analysis with image models if enabled
     if media_type == "video" and input_data.enable_frame_analysis:
