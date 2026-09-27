@@ -2,8 +2,8 @@ import os
 import io
 import sys
 import base64
+import tempfile
 import torch
-import torchvision.transforms as T  # Added for normalization
 import logging
 import time
 import threading
@@ -11,27 +11,26 @@ import gc
 import cv2
 import numpy as np
 import yaml
+from statistics import mean
 from PIL import Image, ImageFile
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 from typing import Dict, Any, Optional, List, Tuple, OrderedDict  # Added OrderedDict
-from dataclasses import dataclass, asdict
 
 # Ensure paths are set for model imports
 module_paths_to_add = [
-    "model_code/cross-efficient-vit",
-    "model_code/efficient-vit",
-    "model_code/preprocessing",
-    "model_code/cross-efficient-vit/efficient_net",
+    "cross-efficient-vit",
+    "efficient-vit",
+    "preprocessing",
+    "cross-efficient-vit/efficient_net",
 ]
-# Construct absolute paths based on the location of app.py
+# The upstream repo is cloned to model_code/ next to app.py (/app/model_code in the image); CEV_MODEL_CODE_DIR overrides
 app_dir = os.path.dirname(os.path.abspath(__file__))
+CODE_DIR = os.environ.get("CEV_MODEL_CODE_DIR", os.path.join(app_dir, "model_code"))
 for path_suffix in module_paths_to_add:
-    # The model_code directory is expected to be a sibling of the directory containing app.py
-    # or directly at /app/model_code if app.py is at /app
-    abs_path = os.path.join(app_dir, path_suffix)
+    abs_path = os.path.join(CODE_DIR, path_suffix)
     if abs_path not in sys.path:
         sys.path.insert(0, abs_path)
 
@@ -51,7 +50,7 @@ except ImportError as e:
     )
     print(f"Current sys.path: {sys.path}", file=sys.stderr)
     print(
-        f"Attempted paths from app_dir ({app_dir}): {[os.path.join(app_dir, p) for p in module_paths_to_add]}",
+        f"Model code dir: {CODE_DIR}",
         file=sys.stderr,
     )
     raise
@@ -79,7 +78,9 @@ app.add_middleware(
 )
 
 MODEL_NAME_DISPLAY = "cross_efficient_vit_service"
-DEVICE = torch.device("cpu")
+DEVICE = torch.device(
+    os.environ.get("MODEL_DEVICE", "cpu")
+)  # the classifier; MTCNN always runs on CPU (fails on MPS)
 
 PRELOAD_MODEL = os.environ.get("PRELOAD_MODEL", "false").lower() == "true"
 MODEL_TIMEOUT = int(os.environ.get("MODEL_TIMEOUT", "900"))
@@ -88,62 +89,32 @@ DEFAULT_MODEL_VARIANT = os.environ.get("DEFAULT_MODEL_VARIANT", "cross_efficient
 MODEL_PATHS = {
     "cross_efficient_vit": os.environ.get(
         "CROSS_EFFICIENT_VIT_MODEL_PATH",
-        "/app/model_code/cross-efficient-vit/pretrained_models/cross_efficient_vit.pth",
+        os.path.join(
+            CODE_DIR, "cross-efficient-vit/pretrained_models/cross_efficient_vit.pth"
+        ),
     ),
     "efficient_vit": os.environ.get(
         "EFFICIENT_VIT_MODEL_PATH",
-        "/app/model_code/efficient-vit/pretrained_models/efficient_vit.pth",
+        os.path.join(CODE_DIR, "efficient-vit/pretrained_models/efficient_vit.pth"),
     ),
 }
 CONFIG_PATHS = {
     "cross_efficient_vit": os.environ.get(
         "CROSS_EFFICIENT_VIT_CONFIG_PATH",
-        "/app/model_code/cross-efficient-vit/configs/architecture.yaml",
+        os.path.join(CODE_DIR, "cross-efficient-vit/configs/architecture.yaml"),
     ),
     "efficient_vit": os.environ.get(
         "EFFICIENT_VIT_CONFIG_PATH",
-        "/app/model_code/efficient-vit/configs/architecture.yaml",
+        os.path.join(CODE_DIR, "efficient-vit/configs/architecture.yaml"),
     ),
 }
 
-FRAMES_PER_VIDEO_TO_SAMPLE = int(os.environ.get("FRAMES_PER_VIDEO", "15"))
-FACE_DETECTOR_THRESHOLD = [0.7, 0.8, 0.8]
-MTCNN_MIN_FACE_SIZE = 40  # As in original repo
-
-# ImageNet Normalization (crucial for EfficientNet backbones)
-IMAGENET_NORMALIZE_TRANSFORM = T.Normalize(
-    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+# Upstream test.py / preprocessing (davide-coccomini repo @ 2f5305e7): 30 equidistant frames, FacenetDetector
+FRAMES_PER_VIDEO_TO_SAMPLE = int(os.environ.get("FRAMES_PER_VIDEO", "30"))
+FACE_DETECTOR_THRESHOLD = [0.85, 0.95, 0.95]
+MAX_IDENTITIES = (
+    3  # upstream groups crops by face index 0..2 (MTCNN orders boxes by area)
 )
-
-
-@dataclass
-class FaceDetail:
-    """Details about a detected face in a frame."""
-    face_id: int
-    bbox: List[int]  # [x, y, width, height]
-    score: float
-    confidence: float  # MTCNN detection confidence
-
-
-@dataclass
-class FrameDetail:
-    """Details about a processed frame."""
-    frame_index: int
-    timestamp_seconds: float
-    faces: List[FaceDetail]
-    frame_score: Optional[float] = None  # Average score of all faces in frame
-
-
-@dataclass
-class VideoAnalysisResult:
-    """Complete video analysis result with per-frame details."""
-    probability: float
-    prediction: int
-    class_label: str
-    total_frames_sampled: int
-    total_faces_analyzed: int
-    frame_details: List[FrameDetail]
-    per_face_scores: List[float]
 
 
 model_instance: Optional[torch.nn.Module] = None
@@ -258,15 +229,9 @@ def load_model_internal(variant_to_load: str):
             _model.eval()
 
             if face_detector_mtcnn is None:
-                logger.info(
-                    f"Initializing MTCNN face detector on {DEVICE} with min_face_size={MTCNN_MIN_FACE_SIZE}..."
-                )
+                # upstream FacenetDetector; detect() returns every box, largest first (select_largest default)
                 face_detector_mtcnn = MTCNN(
-                    keep_all=True,
-                    device=DEVICE,
-                    thresholds=FACE_DETECTOR_THRESHOLD,
-                    min_face_size=MTCNN_MIN_FACE_SIZE,
-                    select_largest=False,
+                    margin=0, thresholds=FACE_DETECTOR_THRESHOLD, device="cpu"
                 )
 
             # Re-initialize transform pipeline if image size changes or not yet initialized
@@ -325,243 +290,151 @@ def unload_model_if_idle():
             logger.info("Model unloaded.")
 
 
-@dataclass
-class ExtractedFrame:
-    """Container for an extracted frame with metadata."""
-    frame_index: int
-    timestamp_seconds: float
-    frame_rgb: np.ndarray
-
-
-def extract_frames_from_video_bytes(
-    video_bytes: bytes, num_frames_to_sample: int
-) -> Tuple[List[ExtractedFrame], float, float]:
-    """
-    Extract frames from video bytes.
-
-    Returns:
-        Tuple of (list of ExtractedFrame, video_duration_seconds, fps)
-    """
-    temp_video_path = f"/tmp/temp_video_{os.urandom(8).hex()}.mp4"  # Using os.urandom for unique filename
-    frames: List[ExtractedFrame] = []
-    video_duration = 0.0
-    fps = 0.0
-
+def extract_frames(
+    video_path: str, num_frames_to_sample: int
+) -> List[Tuple[int, float, np.ndarray]]:
+    """(frame_index, timestamp_seconds, BGR frame) for num_frames_to_sample equidistant frames; [] if undecodable."""
+    cap = cv2.VideoCapture(video_path)
+    frames = []
     try:
-        with open(temp_video_path, "wb") as f:
-            f.write(video_bytes)
-
-        cap = cv2.VideoCapture(temp_video_path)
-        if not cap.isOpened():
-            logger.error(f"Failed to open temporary video file: {temp_video_path}")
-            return frames, 0.0, 0.0
-
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
-
-        if total_frames == 0 or fps <= 0:
-            cap.release()
-            return frames, 0.0, 0.0
-
-        video_duration = total_frames / fps
-
-        frame_indices = np.linspace(
-            0, total_frames - 1, num_frames_to_sample, dtype=int
-        )
-
-        for idx in frame_indices:
+        if not cap.isOpened() or total_frames <= 0 or fps <= 0:
+            return frames
+        for idx in np.unique(
+            np.linspace(0, total_frames - 1, num_frames_to_sample, dtype=int)
+        ):  # each frame once
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
             if ret:
-                timestamp = idx / fps
-                frames.append(ExtractedFrame(
-                    frame_index=int(idx),
-                    timestamp_seconds=round(timestamp, 2),
-                    frame_rgb=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                ))
-
-        cap.release()
-        return frames, video_duration, fps
+                frames.append((int(idx), round(idx / fps, 2), frame))
+        return frames
     finally:
-        if os.path.exists(temp_video_path):
-            try:
-                os.remove(temp_video_path)
-            except OSError as e:
-                logger.warning(
-                    f"Could not remove temp video file {temp_video_path}: {e}"
-                )
+        cap.release()
 
 
-def process_video_and_predict(
-    video_bytes: bytes, input_threshold: float, variant_to_load: str
-) -> VideoAnalysisResult:
+def custom_video_round(preds: List[float]) -> float:
+    """Upstream cross-efficient-vit/utils.py: the first identity above 0.55 decides, else the mean."""
+    return next((p for p in preds if p > 0.55), mean(preds))
+
+
+def face_crops(frame_bgr: np.ndarray) -> List[Tuple[int, np.ndarray, List[int], float]]:
+    """Upstream detect_faces.py + extract_crops.py: MTCNN on the half-size RGB frame, boxes scaled back and squared
+    by padding the short side (no margin); crops stay BGR. Returns (identity, crop, [x, y, w, h], confidence).
     """
-    Process video and return detailed analysis with per-frame/per-face scores.
-
-    Returns:
-        VideoAnalysisResult with complete analysis details
-    """
-    ensure_model_loaded(variant_to_load)
-    if not all(
-        [
-            model_instance,
-            face_detector_mtcnn,
-            face_transform_pipeline,
-            model_config_loaded,
-        ]
+    rgb = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    boxes, probs = face_detector_mtcnn.detect(
+        rgb.resize(size=[s // 2 for s in rgb.size]), landmarks=False
+    )
+    crops = []
+    for j, (box, prob) in enumerate(
+        zip(boxes[:MAX_IDENTITIES], probs) if boxes is not None else ()
     ):
-        raise HTTPException(
-            status_code=503,
-            detail=f"Model or preprocessor for '{variant_to_load}' not available.",
-        )
+        xmin, ymin, xmax, ymax = [int(b * 2) for b in box]
+        w, h = xmax - xmin, ymax - ymin
+        p_w = int((h - w) / 2) if h > w else 0
+        p_h = int((w - h) / 2) if w > h else 0
+        crop = frame_bgr[
+            max(ymin - p_h, 0) : ymax + p_h, max(xmin - p_w, 0) : xmax + p_w
+        ]
+        if crop.size:
+            crops.append((j, crop, [xmin, ymin, w, h], float(prob)))
+    return crops
 
-    extracted_frames, video_duration, fps = extract_frames_from_video_bytes(
-        video_bytes, FRAMES_PER_VIDEO_TO_SAMPLE
+
+def _abstain(
+    reason: str, frames_sampled: int = 0, frame_details: Optional[list] = None
+) -> Dict[str, Any]:
+    return {
+        "probability": None,
+        "prediction": None,
+        "class": "abstain",
+        "abstain_reason": reason,
+        "total_frames_sampled": frames_sampled,
+        "total_faces_analyzed": 0,
+        "per_face_scores": [],
+        "frame_details": frame_details or [],
+    }
+
+
+def score_video(
+    path: str, threshold: float = 0.5, variant: str = DEFAULT_MODEL_VARIANT
+) -> Dict[str, Any]:
+    """Contract C11: P(fake) as upstream test.py computes it, or an abstention (probability None) with its reason."""
+    try:
+        ensure_model_loaded(variant)
+    except Exception as e:
+        logger.error(f"Model '{variant}' unavailable: {e}")
+        return _abstain("model_unavailable")
+
+    frames = extract_frames(path, FRAMES_PER_VIDEO_TO_SAMPLE)
+    if not frames:
+        return _abstain("no_frames")
+
+    faces = []  # (identity, frame_detail face dict, 224x224 BGR uint8)
+    frame_details = []
+    for frame_idx, timestamp, frame in frames:
+        detail = {
+            "frame_index": frame_idx,
+            "timestamp_seconds": timestamp,
+            "faces": [],
+            "frame_score": None,
+        }
+        frame_details.append(detail)
+        for identity, crop, bbox, confidence in face_crops(frame):
+            face = {
+                "face_id": identity,
+                "bbox": bbox,
+                "score": None,
+                "confidence": confidence,
+            }
+            detail["faces"].append(face)
+            faces.append((identity, face, face_transform_pipeline(image=crop)["image"]))
+    if not faces:
+        return _abstain("no_faces", len(frames), frame_details)
+
+    try:
+        # upstream feeds raw 0-255 BGR floats: no /255, no ImageNet normalisation
+        batch = (
+            torch.from_numpy(np.stack([f[2] for f in faces]))
+            .permute(0, 3, 1, 2)
+            .float()
+        )
+        scores = []
+        with torch.no_grad():
+            for i in range(0, len(batch), 32):
+                scores += (
+                    torch.sigmoid(model_instance(batch[i : i + 32].to(DEVICE)))
+                    .flatten()
+                    .cpu()
+                    .tolist()
+                )
+    except Exception as e:
+        logger.exception(f"Inference failed: {e}")
+        return _abstain("model_unavailable", len(frames), frame_details)
+
+    per_identity: Dict[int, List[float]] = {}
+    for (identity, face, _), score in zip(faces, scores):
+        face["score"] = score
+        per_identity.setdefault(identity, []).append(score)
+    for detail in frame_details:
+        if detail["faces"]:
+            detail["frame_score"] = mean(f["score"] for f in detail["faces"])
+
+    probability = float(
+        custom_video_round([mean(per_identity[k]) for k in sorted(per_identity)])
     )
-    if not extracted_frames:
-        logger.warning("No frames extracted from video.")
-        return VideoAnalysisResult(
-            probability=0.5,
-            prediction=0,
-            class_label="real",
-            total_frames_sampled=0,
-            total_faces_analyzed=0,
-            frame_details=[],
-            per_face_scores=[]
-        )
-
-    all_face_scores: List[float] = []
-    frame_details: List[FrameDetail] = []
-
-    for extracted_frame in extracted_frames:
-        frame = extracted_frame.frame_rgb
-        frame_idx = extracted_frame.frame_index
-        timestamp = extracted_frame.timestamp_seconds
-
-        frame_faces: List[FaceDetail] = []
-
-        try:
-            # MTCNN expects RGB numpy array or PIL Image
-            # Frame is already HWC RGB numpy array
-            boxes, probs, landmarks = face_detector_mtcnn.detect(
-                frame, landmarks=True
-            )  # Get landmarks for potential alignment if needed
-
-            if boxes is not None:
-                for i, (box, prob, landmark) in enumerate(
-                    zip(boxes, probs, landmarks)
-                ):  # Iterate through detected faces in the frame
-                    if prob < FACE_DETECTOR_THRESHOLD[2]:
-                        continue  # Using MTCNN's final stage threshold as a filter
-
-                    xmin, ymin, xmax, ymax = [int(b) for b in box]
-
-                    # Face padding strategy (consistent with original repo's train/test)
-                    w_face = xmax - xmin
-                    h_face = ymax - ymin
-
-                    # Proportional padding
-                    pad_h_local = h_face // 3
-                    pad_w_local = w_face // 3
-
-                    crop_xmin = max(0, xmin - pad_w_local)
-                    crop_ymin = max(0, ymin - pad_h_local)
-                    crop_xmax = min(frame.shape[1], xmax + pad_w_local)
-                    crop_ymax = min(frame.shape[0], ymax + pad_h_local)
-
-                    face_crop_rgb = frame[crop_ymin:crop_ymax, crop_xmin:crop_xmax]
-
-                    if face_crop_rgb.size == 0:
-                        logger.debug(
-                            f"Empty face crop for frame {frame_idx}, face {i}. Skipping."
-                        )
-                        continue
-
-                    # Albumentations transform (IsotropicResize, PadIfNeeded)
-                    transformed_face = face_transform_pipeline(image=face_crop_rgb)[
-                        "image"
-                    ]  # HWC, uint8
-
-                    # Convert to tensor, scale to [0,1]
-                    face_tensor_float_01 = (
-                        torch.from_numpy(transformed_face.astype(np.float32)).permute(
-                            2, 0, 1
-                        )
-                        / 255.0
-                    )
-
-                    # Apply ImageNet normalization
-                    normalized_face_tensor = IMAGENET_NORMALIZE_TRANSFORM(
-                        face_tensor_float_01
-                    )
-
-                    face_tensor_final = normalized_face_tensor.unsqueeze(0).to(
-                        DEVICE
-                    )  # NCHW
-
-                    with torch.no_grad():
-                        logits = model_instance(face_tensor_final)
-                        score = torch.sigmoid(logits).squeeze().item()
-
-                    all_face_scores.append(score)
-
-                    # Store face details with bbox in [x, y, width, height] format
-                    face_details = FaceDetail(
-                        face_id=i,
-                        bbox=[xmin, ymin, w_face, h_face],
-                        score=float(score),
-                        confidence=float(prob)
-                    )
-                    frame_faces.append(face_details)
-            else:
-                logger.debug(f"No faces detected in frame {frame_idx} with MTCNN.")
-        except Exception as e_frame:
-            logger.warning(
-                f"Error processing a frame/face (frame {frame_idx}): {e_frame}",
-                exc_info=False,
-            )
-            continue
-
-        # Calculate frame-level score (average of all faces in this frame)
-        frame_score = None
-        if frame_faces:
-            frame_score = float(np.mean([f.score for f in frame_faces]))
-
-        frame_details.append(FrameDetail(
-            frame_index=frame_idx,
-            timestamp_seconds=timestamp,
-            faces=frame_faces,
-            frame_score=frame_score
-        ))
-
-    if not all_face_scores:
-        logger.info(
-            "No faces detected or processed successfully across all sampled frames."
-        )
-        return VideoAnalysisResult(
-            probability=0.5,
-            prediction=0,
-            class_label="real",
-            total_frames_sampled=len(extracted_frames),
-            total_faces_analyzed=0,
-            frame_details=frame_details,
-            per_face_scores=[]
-        )
-
-    # Aggregation: simple mean of scores
-    final_video_prob_fake = float(np.mean(all_face_scores))
-    final_video_prediction = 1 if final_video_prob_fake >= input_threshold else 0
-    final_video_class_label = "fake" if final_video_prediction == 1 else "real"
-
-    return VideoAnalysisResult(
-        probability=final_video_prob_fake,
-        prediction=final_video_prediction,
-        class_label=final_video_class_label,
-        total_frames_sampled=len(extracted_frames),
-        total_faces_analyzed=len(all_face_scores),
-        frame_details=frame_details,
-        per_face_scores=all_face_scores
-    )
+    prediction = 1 if probability >= threshold else 0
+    return {
+        "probability": probability,
+        "prediction": prediction,
+        "class": "fake" if prediction else "real",
+        "abstain_reason": None,
+        "total_frames_sampled": len(frames),
+        "total_faces_analyzed": len(scores),
+        "per_face_scores": scores,
+        "frame_details": frame_details,
+    }
 
 
 @app.on_event("startup")
@@ -694,67 +567,24 @@ async def unload_model_endpoint():
     }
 
 
-def _serialize_frame_details(frame_details: List[FrameDetail]) -> List[Dict[str, Any]]:
-    """Serialize frame details to JSON-serializable format."""
-    result = []
-    for fd in frame_details:
-        faces_list = []
-        for face in fd.faces:
-            faces_list.append({
-                "face_id": face.face_id,
-                "bbox": face.bbox,
-                "score": face.score,
-                "confidence": face.confidence
-            })
-        result.append({
-            "frame_index": fd.frame_index,
-            "timestamp_seconds": fd.timestamp_seconds,
-            "faces": faces_list,
-            "frame_score": fd.frame_score
-        })
-    return result
-
-
 @app.post("/predict", response_model=Dict[str, Any])
 async def predict_video(input_data: VideoInput):
     req_start_time = time.time()
-    try:
-        video_bytes = base64.b64decode(input_data.video_data)
-
-        result = process_video_and_predict(
-            video_bytes, input_data.threshold, input_data.model_variant
-        )
-
-        inference_time = time.time() - req_start_time
-        logger.info(
-            f"Video prediction for variant '{input_data.model_variant}' completed in {inference_time:.4f}s. "
-            f"Prob Fake: {result.probability:.4f}, Class: {result.class_label}, "
-            f"Frames: {result.total_frames_sampled}, Faces: {result.total_faces_analyzed}"
-        )
-
-        return {
-            "model": f"{MODEL_NAME_DISPLAY}_{input_data.model_variant}",
-            "probability": result.probability,
-            "prediction": result.prediction,
-            "class": result.class_label,
-            "inference_time": inference_time,
-            # Enhanced details for per-frame/per-face analysis
-            "total_frames_sampled": result.total_frames_sampled,
-            "total_faces_analyzed": result.total_faces_analyzed,
-            "frame_details": _serialize_frame_details(result.frame_details),
-            "per_face_scores": result.per_face_scores,
-        }
-    except FileNotFoundError as e:
-        logger.error(f"Model file error during prediction: {e}", exc_info=True)
-        raise HTTPException(status_code=503, detail=f"Model resources missing: {e}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"Error during video prediction: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Internal server error during video prediction: {e}",
-        )
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as f:
+        f.write(base64.b64decode(input_data.video_data))
+        f.flush()
+        result = score_video(f.name, input_data.threshold, input_data.model_variant)
+    inference_time = time.time() - req_start_time
+    logger.info(
+        f"Video prediction for variant '{input_data.model_variant}' completed in {inference_time:.4f}s. "
+        f"Prob Fake: {result['probability']}, Class: {result['class']} ({result['abstain_reason']}), "
+        f"Frames: {result['total_frames_sampled']}, Faces: {result['total_faces_analyzed']}"
+    )
+    return {
+        "model": f"{MODEL_NAME_DISPLAY}_{input_data.model_variant}",
+        **result,
+        "inference_time": inference_time,
+    }
 
 
 if __name__ == "__main__":
